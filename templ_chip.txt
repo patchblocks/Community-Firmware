@@ -1,0 +1,703 @@
+/*
+===============================================================================
+ Author      : Sebastian Heinz
+ Version     : 0.5.1
+ Copyright   : Mindflood LTD 2016
+ Description : Template file for Patchblocks firmware
+
+ CUSTOM COMMUNITY FIRMWARE PROJECT
+ This is a customised version of the standard PatchBlocks firmware made by
+ the community of PatchBlocks users.
+
+ For blocks the exploit this custom firmware, please check for the #define value
+  COMMUNITY_FIRMWARE_VERSION and generate a compiler message if the version is wrong
+  using the code...
+  #if COMMUNITY_FIRMWARE_VERSION<RequiredVersion
+    #pragma message "ERROR: BlockNameHere requires custom community firmware version RequiredVersion"
+  #endif
+
+ Community Revision History:
+   1.5.3 ----------------------------------------------------------------------
+   05/07/2017 Theo Niessink (Tale)
+     Version     : 20170705
+     o Fixes earlier mentioned 2-byte MIDI message support 
+     o Fixed hanging MIDI notes with MIDI controllers that send out Channel
+       Pressure (After-Touch) [or Program Change].
+     o Fixed receiving Pitch Bend on MIDI channel other than channel 1.
+
+   12/07/2017 Theo Niessink (Tale)
+     Version     : 20170712
+     Description : http://www.taletn.com/patchblocks/
+     o Added MIDI low/high/last-note priority support to firmware.
+     o Added MIDI running status support to firmware.
+     o Added customized firmware.
+
+   12/08/2017 Chris Jeffery (Maikshifter)
+     o Added support for run-time control of MIDI Through (MIDI Through RT block)
+
+===============================================================================
+*/
+#define STR_COMMUNITY_FIRMWARE_VERSION "1.5.3"
+//Note: Use leading zeros eg 1.3.4 becomes 1.03.04 becomes 10304
+#define COMMUNITY_FIRMWARE_VERSION     10503
+
+//Maikshifter> All messages from the compile appear as errors in the Patch Blocks console.
+//             So it is preferable for each block to check COMMUNITY_FIRMWARE_VERSION
+//             and instead generate a error message is necessary there.
+//#pragma message "Custom Community Firmware Version " STR_COMMUNITY_FIRMWARE_VERSION
+
+
+#include "LPC13xx.h"
+
+//#define DEVBOARD													// use settings for development board
+
+#define CPU_RATE			72000000								// cpu frequency in Hz
+#define SMP_RATE			20000									// audio sampling rate of the DSP in Hz
+#define CTL_RATE			100										// rate of processes running in control space in Hz
+#ifdef DEVBOARD
+	#define ANALOG_1_PIN	3										// ADC pin used for poti 1
+	#define ANALOG_2_PIN	3										// ADC pin used for poti 2
+	#define INPUT_1_PIN		3										// ADC pin used for left audio
+	#define INPUT_2_PIN		3										// ADC pin used for right audio
+#else
+	#define ANALOG_1_PIN	0										// ADC pin used for poti 1
+	#define ANALOG_2_PIN	2										// ADC pin used for poti 2
+	#define INPUT_1_PIN		6										// ADC pin used for left audio
+	#define INPUT_2_PIN		1										// ADC pin used for right audio
+	#define BAT_PIN			7										// ADC pin for battery measure
+#endif
+
+#define	midi_out	LPC_UART->THR
+#define	midi_in		LPC_UART->RBR
+
+#define	M_N_OFF		0x80	//	Note Off
+#define	M_N_ON		0x90	//	Note On
+#define	M_CC		0xB0	//	Control Change
+#define	M_PB		0xE0	//	Pitch Bend
+#define	M_TC		0xF8	//	Timing Clock
+#define	M_START		0xFA	//	Start
+#define	M_CONT		0xFB	//	Continue
+#define	M_STOP		0xFC	//	Stop
+
+typedef uint32_t bool;
+volatile static uint32_t midi_clock = 0;
+volatile static uint32_t midi_play = 0;
+volatile static uint32_t ctl_count = 0; 							// counter to relate control rate to sample rate
+volatile static uint32_t control_value[4] = {0, 0, 0, 0};			// holds the adc and button values for control
+volatile static uint32_t led_value[2] = {1, 1};
+volatile static int32_t out[4] = {0, 0, 0, 0};
+volatile static int32_t in[4] = {0, 0, 0, 0};
+volatile static int32_t left;
+volatile static int32_t right;
+volatile static int32_t right;
+volatile static int32_t bus[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+//uint32_t dsp_active = 0;
+//uint32_t test = 0;
+uint32_t channels = (1<<INPUT_1_PIN) | (1<<INPUT_2_PIN);
+uint8_t battery_low = 0;
+uint32_t *midi_cps = 0;
+
+
+//CCFP: Maikshifter
+#define FIRMWARE_FLAGS
+#ifdef FIRMWARE_FLAGS
+  #define PBFW_MIDITHROUGH (1<<0)
+  #define PBFW_undefined2  (1<<1)
+  //#define PBFW_undefined3  (1<<2)
+  //#define PBFW_undefined4  (1<<3)
+  //#define PBFW_undefined5  (1<<4)
+  //#define PBFW_undefined6  (1<<5)
+  //#define PBFW_undefined7  (1<<6)
+  //#define PBFW_undefined8  (1<<7)
+  uint8_t bmFirmwareFlags = 0;
+#endif
+
+
+void register_voice();
+void register_cc();
+void register_pb();
+void memcpy();
+
+inline uint32_t ran(void) {
+	static uint32_t randSeed = 22222;
+	randSeed = (randSeed * 196314165) + 907633515;
+	return randSeed >> 22;
+}
+
+inline int32_t sin(int32_t x) {
+	const int qN = 13, qA= 12, qP= 15, qR= 2*qN-qP, qS= qN+qP+1-qA;
+	x = x<<(30-qN);								// input is Q13 quadrant (0..4)
+	if( (x^(x<<1)) < 0)							// test for quadrant 1 or 2
+		x= (1<<31) - x;
+	x= x>>(30-qN);
+	return x * ( (3<<qP) - (x*x>>qR) ) >> qS;	// output is Q12 (-1..1)
+}
+
+//----------------------------------- DYNAMICALLY GENERATED -----------------------------------
+###dynamic###
+//--------------------------------- END DYNAMICALLY GENERATED ---------------------------------
+
+inline void init_timers(){
+	LPC_SYSCON->SYSAHBCLKCTRL |= (1<<8) | (1<<9) | (1<<10);	// clock to TC32_0 and TC16_1
+	NVIC_EnableIRQ(TIMER_32_1_IRQn);
+	NVIC_SetPriority(TIMER_32_1_IRQn, 2);
+	
+	// Main DSP timer
+	LPC_TMR32B1->PR  = 0;							// prescaler
+	LPC_TMR32B1->MCR = (1<<0) | (1<<1);				// interrupt on MR0 match and reset
+	LPC_TMR32B1->MR0 = CPU_RATE / SMP_RATE;			// set first interval
+	LPC_TMR32B1->TCR = 1;							// reset timer
+	LPC_IOCON->R_PIO1_2 = 3;						// configure as MAT
+	LPC_IOCON->SWDIO_PIO1_3 = 3;					// configure as MAT
+	
+	// Digital in 1 timer
+	LPC_TMR32B0->PR  = 0;							// prescaler
+	LPC_TMR32B0->TCR = 1;							// reset timer
+	LPC_TMR32B0->CCR = (1<<1);						// capture on falling edge
+	LPC_IOCON->PIO1_5 = 2;							// configure as CAP
+	LPC_IOCON->PIO1_5 |= (1<<3);					// pull-down resistor
+
+	// Digital in 2 timer
+	LPC_TMR16B1->PR  = 0;							// prescaler
+	LPC_TMR16B1->TCR = 1;							// reset timer
+	LPC_TMR16B1->CCR = (1<<1);						// capture on falling edge
+	LPC_IOCON->PIO1_8 = 1;							// configure as CAP
+	LPC_IOCON->PIO1_8 |= (1<<3);					// pull-down resistor
+
+	LPC_TMR32B1->TC = 0;
+	LPC_TMR32B0->TC = 1;
+	LPC_TMR16B1->TC = 2;
+}
+
+inline void init_adc(){
+	if(ANALOG_1_PIN == 0 || ANALOG_2_PIN == 0 || INPUT_1_PIN == 0 || INPUT_2_PIN == 0 || BAT_PIN == 0)
+			LPC_IOCON->JTAG_TDI_PIO0_11 = 2;
+	if(ANALOG_1_PIN == 1 || ANALOG_2_PIN == 1 || INPUT_1_PIN == 1 || INPUT_2_PIN == 1 || BAT_PIN == 1)
+			LPC_IOCON->JTAG_TMS_PIO1_0 = 2;
+	if(ANALOG_1_PIN == 2 || ANALOG_2_PIN == 2 || INPUT_1_PIN == 2 || INPUT_2_PIN == 2 || BAT_PIN == 2)
+			LPC_IOCON->JTAG_TDO_PIO1_1 = 2;
+	if(ANALOG_1_PIN == 3 || ANALOG_2_PIN == 3 || INPUT_1_PIN == 3 || INPUT_2_PIN == 3 || BAT_PIN == 3)
+			LPC_IOCON->JTAG_nTRST_PIO1_2 = 2;
+	if(ANALOG_1_PIN == 4 || ANALOG_2_PIN == 4 || INPUT_1_PIN == 4 || INPUT_2_PIN == 4 || BAT_PIN == 4)
+			LPC_IOCON->ARM_SWDIO_PIO1_3 = 2;
+	if(ANALOG_1_PIN == 5 || ANALOG_2_PIN == 5 || INPUT_1_PIN == 5 || INPUT_2_PIN == 5 || BAT_PIN == 5)
+			LPC_IOCON->PIO1_4 = 1;
+	if(ANALOG_1_PIN == 6 || ANALOG_2_PIN == 6 || INPUT_1_PIN == 6 || INPUT_2_PIN == 6 || BAT_PIN == 6)
+			LPC_IOCON->PIO1_10 = 1;
+	if(ANALOG_1_PIN == 7 || ANALOG_2_PIN == 7 || INPUT_1_PIN == 7 || INPUT_2_PIN == 7 || BAT_PIN == 7)
+			LPC_IOCON->PIO1_11 = 1;
+	LPC_SYSCON->SYSAHBCLKCTRL |= (1<<13);
+	LPC_SYSCON->PDRUNCFG &= ~(0x1<<4);
+	NVIC_EnableIRQ(ADC_IRQn);
+	NVIC_SetPriority(ADC_IRQn, 0);
+	//LPC_ADC->INTEN = 0x1FF;
+	LPC_ADC->INTEN = (1<<INPUT_1_PIN) | (1<<ANALOG_2_PIN); // use the higher ADC number
+}
+
+inline void init_spi(){
+	#ifdef DEVBOARD
+		LPC_IOCON->SCKLOC = 0x01;				// Selects SCK function for pin PIO2_11/SCK (P2.11)
+		LPC_IOCON->PIO2_11 = 0x01;				// Selects function SCK for P2.11
+	#else
+		LPC_IOCON->SCKLOC = 0x00;				// Selects SCK function for pin SWCLK/PIO0_10/SCK/CT16B0_MAT2 (P0.10)
+		LPC_IOCON->JTAG_TCK_PIO0_10 = 0x02;		// Selects function SCK for P0.10
+	#endif
+	LPC_SYSCON->PRESETCTRL |= 0x01;				// De-assert SSP reset
+	LPC_SYSCON->SYSAHBCLKCTRL |= (1<<11);		// Enables clock for SSP
+	LPC_IOCON->PIO0_8 = 0x01;					// Selects function MISO for P0.8
+	LPC_IOCON->PIO0_9 = 0x01;					// Selects function MOSO for P0.9
+	LPC_IOCON->PIO0_2 = 0x01;					// Select internal SSEL for P0.2
+	LPC_GPIO0->DIR |= (1<<7);					// Set pin for LDAC to output
+	LPC_GPIO0->MASKED_ACCESS[(1<<7)] = (1<<7);	// Set LDAC pin high
+	LPC_SSP->CR0 = 0x70F;						// Set DSS data to 16-bit, Frame format SPI, CPOL = 0, CPHA = 0, and SCR is 15
+	LPC_SSP->CPSR = 0x2;						// Set prescaler to 2
+	LPC_SSP->CR1 = (1<<1);						// Set SSP enabled
+}
+
+inline void init_uart(){
+	LPC_IOCON->PIO1_6 = 0x1;					// Set resistor for new Midiblock
+	
+	// If you have an old Midiblock, uncomment the following two lines and remove the line above
+	//LPC_IOCON->PIO1_6 &= ~0x07;				// Configure I/O
+	//LPC_IOCON->PIO1_6 |= 0x01;				// Set RXD function for P1.6
+	
+	LPC_IOCON->PIO1_7 &= ~0x07;					//
+	LPC_IOCON->PIO1_7 |= 0x01;					// Set TXD function for P1.7
+
+	LPC_SYSCON->SYSAHBCLKCTRL |= (1<<12);		// Enable clock for UART
+	LPC_SYSCON->UARTCLKDIV = 6;					// Divide by 6
+
+	LPC_UART->LCR = 0x83;						// 8-bit length word, 1 stop bit, DLAB = 1 (disable RX/TX)
+
+/*	BAUDRATE = PCLK / 16*(256*DLM+DLL)*(1+DIVADDVAL/MULVAL)	*/
+	LPC_UART->FDR = 0x10;						// MULVAL = 1, DIVADDVAL = 0
+	LPC_UART->DLM = 0x00;						// Divisor Latch MSB
+	LPC_UART->DLL = 0x18;						// Divisor Latch LSB
+/*	(72000000/6)/16*(256*0+24)*(1+0/1) = 31250	*/
+
+	LPC_UART->LCR = 0x03;						// DLAB = 0 (enable RX/TX)
+	LPC_UART->FCR = 0x07;						// Enable RX/TX FIFOs, and reset (clear) FIFOs
+	//LPC_UART->ACR = 0x7;
+}
+
+#ifdef MIDI
+	uint8_t midi_header = 0;
+	uint32_t midi_message = 0;
+	uint8_t midi_byte_num = 0;
+	uint8_t a = 0;
+	
+	#ifdef MIDI_NOTES
+		uint8_t midi_voice_num = 0;
+		uint8_t midi_last_voice = 0;
+		mnotein *midi_voice_buffer[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+		inline void register_voice(mnotein *data){
+			midi_voice_buffer[midi_voice_num] = data;
+			data->msg = 0;
+			midi_voice_num++;
+
+	}
+		#ifdef MIDI_NOTE_PRIO
+			uint8_t midi_note_buffer[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+			uint8_t midi_note_num = 0;
+		#endif
+	#endif
+
+	#ifdef MIDI_CC
+		uint8_t midi_cc_num = 0;
+		mccin *midi_cc_buffer[32] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+		inline void register_cc(mccin *data){
+			midi_cc_buffer[midi_cc_num] = data;
+			midi_cc_num++;
+		}
+	#endif
+
+	#ifdef MIDI_PB
+		uint8_t midi_pb_num = 0;
+		mpbin *midi_pb_buffer[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+		inline void register_pb(mpbin *data){
+			midi_pb_buffer[midi_pb_num] = data;
+			midi_pb_num++;
+		}
+	#endif
+
+	inline void midi_handler(){
+		uint8_t byte = 0;
+		read_uart:
+		byte = 0;
+		while(LPC_UART->LSR & 0x01){
+			byte = LPC_UART->RBR;
+			//midi_out = LPC_UART->LSR;
+			#ifdef MIDI_THROUGH
+				midi_out = byte;
+      #else
+        #ifdef RT_MIDI_THROUGH
+        if ( bmFirmwareFlags&PBFW_MIDITHROUGH )
+          midi_out = byte;
+        #endif
+			#endif
+			if((byte & 0xF0) == M_N_ON){
+				midi_message = (byte << 16);
+				midi_header = M_N_ON;
+				midi_byte_num = 0;
+				//byte = 0;
+			}else if((byte & 0xF0) == M_N_OFF){
+				midi_message = (byte << 16);
+				midi_header = M_N_OFF;
+				midi_byte_num = 0;
+				//byte = 0;
+			}else if((byte & 0xF0) == M_CC){
+				midi_message = (byte << 16);
+				midi_header = M_CC;
+				midi_byte_num = 0;
+				//byte = 0;
+			}else if((byte & 0xF0) == M_PB){
+				midi_header = M_PB;
+				midi_message = (byte << 16);
+				midi_byte_num = 0;
+				//byte = 0;
+			}else if(byte == M_TC){ // realtime
+				midi_clock = 1;
+				//byte = 0;
+			}else if(byte == M_START){
+				midi_play = 1;
+				//byte = 0;
+			}else if(byte == M_STOP){
+				midi_play = 0;
+				//byte = 0;
+			}else if((byte >> 7) == 0){ // data bytes
+				if(midi_byte_num == 0){
+					midi_byte_num = 1;
+					midi_message &= 0xFF0000;
+					midi_message |= (byte << 8);
+				}else{
+					midi_message |= byte; // message complete
+					midi_byte_num = 0;
+					//byte = 0;
+					if(midi_header == M_N_ON){
+						goto note_on;
+					}else if(midi_header == M_N_OFF){
+						goto note_off;
+					}else if(midi_header == M_CC){
+						goto control_change;
+					}else if(midi_header == M_PB){
+						goto pitch_bend;
+					}
+					goto read_uart;
+				}
+			}else{
+				midi_header = 0;
+				//byte = 0;
+			}
+			
+		}
+		return; // all bytes read and processed
+		
+	#ifdef MIDI_NOTES // only if note in is used
+		note_on:
+		if(midi_voice_num > 0){ // only bother when using midi input blocks
+			if((byte & 0x7F) != 0){ // has velocity
+				uint32_t ch = ((midi_message & 0xF0000) >> 6) + (1<<10);
+				if(midi_voice_num == 1){ // legato
+					if(
+						(midi_voice_buffer[0]->midi_channel == ch)
+					||	!midi_voice_buffer[0]->midi_channel
+					){
+					#ifdef MIDI_NOTE_PRIO // only if note priority is used
+						const uint8_t note = (midi_message >> 8);
+						a = 0;
+						while((a < midi_note_num) && (midi_note_buffer[a] != note)){
+							a++;
+						}
+						if((a >= midi_note_num) && (midi_note_num < 16)){
+							midi_note_buffer[midi_note_num++] = note;
+						}
+						#if MIDI_NOTE_PRIO < 2
+						const int32_t note_no = (note << 10);
+						if(
+							(midi_note_num > 1)
+							#if !MIDI_NOTE_PRIO
+						&&	(note_no > midi_voice_buffer[0]->out1) // low-note priority
+							#else
+						&&	(note_no < midi_voice_buffer[0]->out1) // high-note priority
+							#endif
+						){
+							goto read_uart;
+						}
+						#endif
+					#endif
+						midi_voice_buffer[0]->out0 = (1<<10);
+						midi_voice_buffer[0]->out1 = ((midi_message & 0xFF00) << 2);
+						midi_voice_buffer[0]->out2 = (byte << 3);
+						midi_voice_buffer[0]->out3 = ch;
+						midi_voice_buffer[0]->msg = midi_message;
+					}
+				}else{
+					a = 0;
+					uint8_t pos = midi_last_voice; // round robin
+					while(a <= midi_voice_num){ // only run around once
+						if(pos >= midi_voice_num){ // loop
+							pos = 0;
+						}else{
+							pos++;
+						}
+						if(!midi_voice_buffer[pos]->msg){ // voice empty
+							if(
+								(midi_voice_buffer[pos]->midi_channel == ch)
+							||	!midi_voice_buffer[pos]->midi_channel
+							){
+								midi_last_voice = pos;
+								midi_voice_buffer[pos]->out0 = (1<<10);
+								midi_voice_buffer[pos]->out1 = ((midi_message & 0xFF00) << 2);
+								midi_voice_buffer[pos]->out2 = (byte << 3);
+								midi_voice_buffer[pos]->out3 = ch;
+								midi_voice_buffer[pos]->msg = midi_message;
+								break;
+							}
+						}
+						a++;
+					}
+				}
+			}else{
+				goto note_off; // 0 velocity jumps to note off
+			}
+		}
+		goto read_uart; // make sure to read all
+
+		note_off:
+		#ifdef MIDI_NOTE_PRIO // only if note priority is used
+		if(midi_voice_num == 1){ // mono
+			uint8_t note = (midi_message >> 8);
+			a = 0;
+			while((a < midi_note_num) && (midi_note_buffer[a] != note)){
+				a++;
+			}
+			if((a < midi_note_num) && (--midi_note_num > a)){
+				memcpy(midi_note_buffer + a, midi_note_buffer + a + 1, midi_note_num - a);
+			}
+			if((midi_voice_buffer[0]->msg & 0x0FFF00) == (midi_message & 0x0FFF00)){ // same channel and note
+				note = 128;
+				#if MIDI_NOTE_PRIO >= 2
+				if(midi_note_num){
+					note = midi_note_buffer[midi_note_num - 1]; // last-note priority
+				}
+				#else
+				for(a = 0; a < midi_note_num; ++a){
+					if(
+						#if MIDI_NOTE_PRIO >= 1
+						(note & 128) || (midi_note_buffer[a] > note) // high-note priority
+						#else
+						midi_note_buffer[a] < note // low-note priority
+						#endif
+					){
+						note = midi_note_buffer[a];
+					}
+				}
+				#endif
+				if(!(note & 128)){
+					midi_voice_buffer[0]->out1 = (note << 10);
+					midi_voice_buffer[0]->msg = (midi_voice_buffer[0]->msg & 0xFF00FF) | (note << 8);
+				}else{
+					midi_voice_buffer[0]->out0 = 0;
+					midi_voice_buffer[0]->msg = 0;
+				}
+			}
+			goto read_uart;
+		}
+		#endif
+		a = 0;
+		while(a < midi_voice_num){
+			if((midi_voice_buffer[a]->msg & 0x0FFF00) == (midi_message & 0x0FFF00)){ // same channel and note 
+				midi_voice_buffer[a]->out0 = 0;
+				midi_voice_buffer[a]->msg = 0;
+				break;
+			}
+			a++;
+		}
+		goto read_uart;
+	#else
+		note_on:
+		note_off:
+		goto read_uart;
+	#endif
+
+	#ifdef MIDI_CC
+		control_change:
+		a = 0;
+		while(a < midi_cc_num){
+			if(
+				((midi_cc_buffer[a]->msg & 0x0FFF00) == (midi_message & 0x0FFF00)) // midi ch and cc num
+			||	((midi_cc_buffer[a]->msg & 0xFFFF00) == ((midi_message & 0x00FF00) | 0xFF0000)) // all channels
+			){
+				//test = byte << 3;
+				midi_cc_buffer[a]->out0 = byte << 10;
+			}
+			a++;
+		}
+		goto read_uart;
+		#else
+		control_change:
+		goto read_uart;
+	#endif
+
+	#ifdef MIDI_PB
+		pitch_bend:
+		a = 0;
+		while(a < midi_pb_num){
+			if(
+				(midi_pb_buffer[a]->msg == (midi_message & 0x0F0000)) // midi ch
+			||	(midi_pb_buffer[a]->msg == 0xFF0000) // all channels
+			){
+				int32_t bend_val = (((midi_message << 7) & 0x3F80) | ((midi_message & 0x7F00) >> 8));
+				if(bend_val == 0x3FFF){
+					midi_pb_buffer[a]->out0 = (12 << 10);
+				}else{
+					midi_pb_buffer[a]->out0 = ((bend_val * 3) / 2) - 0x3000;
+				}
+			}
+			a++;
+		}
+		goto read_uart;
+		#else
+		pitch_bend:
+		goto read_uart;
+	#endif
+	}
+#endif
+
+void DSP_Handler(void){
+	//uint32_t t = LPC_TMR32B0->TC + 85;
+	uint32_t t = LPC_TMR32B1->TC + 255;
+	LPC_TMR32B1->EMR = (1<<1) | (1<<2) | (1<<6) | (1<<8);	// MAT pins go high, then low
+	LPC_TMR32B1->MR2 = t + out[2];
+	LPC_TMR32B1->MR1 = t + out[3];
+	//LPC_TMR32B0->MR0 = t + 0;
+	//LPC_TMR32B0->MR1 = t + (control_value[1] * 3);
+	
+	LPC_GPIO0->MASKED_ACCESS[(1<<7)] = 0;		// LDAC low to output previous values from the DAC
+	LPC_GPIO0->MASKED_ACCESS[(1<<7)] = (1<<7);	// LDAC high
+
+	ctl_count++;
+
+	LPC_SYSCON->PDRUNCFG &= ~(1<<4); // power up adc
+	LPC_ADC->CR = channels | (1<<7) | (15<<8) | (1<<16);//(1<<24); // start conversion;
+	//if(!NVIC_GetPendingIRQ(EINT3_IRQn)){
+		__WFI();
+	//}
+	LPC_SYSCON->PDRUNCFG |= (1<<4); // power down adc
+
+	#ifdef MIDI
+	midi_handler();
+	#endif
+
+	audio_rate_handler();
+	
+
+	// clip
+	if(out[0] > 0x1FF)
+		out[0] = 0x1FF;
+	if(out[0] < -(1<<9))
+		out[0] = -(1<<9);
+	if(out[1] > 0x1FF)
+		out[1] = 0x1FF;
+	if(out[1] < -(1<<9))
+		out[1] = -(1<<9);
+	if(out[2] > 0x1FF)
+		out[2] = 0x1FF;
+	if(out[2] < -(1<<9))
+		out[2] = -(1<<9);
+	if(out[3] > 0x1FF)
+		out[3] = 0x1FF;
+	if(out[3] < -(1<<9))
+		out[3] = -(1<<9);
+	out[0] += (1<<9);
+	out[1] += (1<<9);
+	LPC_SSP->DR = (1<<13)|(1<<12)|(out[0]<<2);// Send data to DAC A
+	LPC_SSP->DR = (1<<15)|(1<<13)|(1<<12)|(out[1]<<2); // Send data to DAC B
+	out[2] = (out[2] + 520) * 3;
+	out[3] = (out[3] + 520) * 3;
+	return;
+}
+
+void TIMER32_1_IRQHandler(void) {
+	LPC_TMR32B1->IR = (1<<0);						// Interrupt flag for match channel 2
+	LPC_TMR32B1->MR0 = CPU_RATE / SMP_RATE;
+	DSP_Handler();
+	return;
+}
+
+void PIOINT3_IRQHandler(void) {
+	in[2] = ((LPC_TMR32B0->CR0 - 170) / 3) - 520;
+	in[3] = ((LPC_TMR16B1->CR0 - 165) / 3) - 520;
+	LPC_TMR32B1->TC = 0;
+	LPC_TMR32B0->TC = 1;
+	LPC_TMR16B1->TC = 2;
+	LPC_TMR32B1->MR0 = (CPU_RATE / SMP_RATE) * 2; // watchdog
+	LPC_GPIO3->IC |= (1<<2);
+	DSP_Handler();
+	return;
+}
+
+void ADC_IRQHandler (void)
+{
+	LPC_ADC->CR = 0;
+	if((LPC_ADC->STAT & (1<<ANALOG_2_PIN)) == (1<<ANALOG_2_PIN)){
+		control_value[1] = (1<<10) - ((LPC_ADC->DR[ANALOG_1_PIN] >> 6) & 0x3FF);
+		control_value[0] = (1<<10) - ((LPC_ADC->DR[ANALOG_2_PIN] >> 6) & 0x3FF);
+	}else{
+		in[0] = ((LPC_ADC->DR[INPUT_1_PIN] >> 6) & 0x3FF) - (1<<9);
+		in[1] = ((LPC_ADC->DR[INPUT_2_PIN] >> 6) & 0x3FF) - (1<<9);
+	}
+	return;
+}
+
+int main(void) {
+	LPC_SYSCON->SYSAHBCLKCTRL |= (1<<6); // enable power to sensing pins
+
+	init_adc();
+	init_spi();
+	init_uart();
+	init_dsp_objects();
+
+	#ifdef MIDI2CPS
+		static const uint32_t cps[128] = {8372,8870,9397,9956,10548,11175,11840,12544,13290,14080,14917,15804,16744,17740,18795,19912,21096,22351,23680,25088,26580,28160,29834,31609,33488,35479,37589,39824,42192,44701,47359,50175,53159,56320,59669,63217,66976,70959,75178,79649,84385,89402,94719,100351,106318,112640,119338,126434,133952,141918,150356,159297,168769,178805,189437,200702,212636,225280,238676,252868,267905,283835,300713,318594,337539,357610,378874,401403,425272,450560,477352,505737,535809,567670,601425,637188,675077,715219,757749,802807,850544,901120,954703,1011473,1071618,1135340,1202851,1274376,1350154,1430439,1515497,1605613,1701088,1802240,1909407,2022946,2143237,2270680,2405702,2548752,2700309,2860878,3030994,3211227,3402176,3604480,3818814,4045892,4286473,4541360,4811404,5097505,5400618,5721755,6061989,6422453,6804352,7208960,7637627,8091784,8572947,9082720,9622807,10195009,10801236,11443511,12123977,12844906};
+		midi_cps = (uint32_t*)cps;
+	#endif
+
+	LPC_IOCON->PIO1_9 = 0; // status LED pin
+	LPC_GPIO1->DIR |= (1<<9);
+	LPC_GPIO1->MASKED_ACCESS[(1<<9)] = (1<<9);
+
+	LPC_IOCON->PIO0_8 = 0; // battery sample pin
+	LPC_GPIO0->DIR |= (1<<8);
+	LPC_GPIO0->MASKED_ACCESS[(1<<8)] = 0;
+
+	LPC_IOCON->PIO0_4 = 0; // LED pin
+	LPC_GPIO0->DIR |= (1<<4);
+
+	LPC_IOCON->PIO0_5 = 0; // LED pin
+	LPC_GPIO0->DIR |= (1<<5);
+
+	LPC_IOCON->PIO1_4 = (1<<3) | (1<<7); // enable pull-down resistor
+	LPC_IOCON->PIO0_6 = (1<<3);
+	init_timers();
+	uint16_t battery_count = 0;
+	uint16_t blink_count = 0;
+	
+	LPC_IOCON->PIO3_2 = (1<<5); // enable hysteresis pull-down resistor
+	LPC_GPIO3->DIR &= ~(1<<2); // set direction to input
+	//LPC_GPIO3->IE |= (1<<2); // enable interrupt for PIO3_2
+	LPC_GPIO3->IEV |= (1<<2); // interrupt on rising edge / HIGH level
+	NVIC_EnableIRQ(EINT3_IRQn); // enable handler
+	NVIC_SetPriority(EINT3_IRQn, 1);
+	while(battery_count < 0xFFFF){
+		battery_count++;
+	}
+	battery_count = 0;
+	LPC_GPIO3->IE |= (1<<2); // enable interrupt for PIO3_2
+	while(1){
+		/*if((ctl_count & 0x03) == 0){
+			LPC_GPIO1->MASKED_ACCESS[(1<<9)] = (1<<9);
+		}else{
+			LPC_GPIO1->MASKED_ACCESS[(1<<9)] = 0;
+		}*/	
+		if(ctl_count >= (SMP_RATE / CTL_RATE)){
+			if(battery_count > (CTL_RATE * 10)){ // check battery every minute
+				LPC_GPIO0->MASKED_ACCESS[(1<<8)] = (1<<8);
+			}
+			
+			LPC_SYSCON->PDRUNCFG &= ~(1<<4); // power up adc
+			LPC_ADC->CR = (1<<ANALOG_1_PIN) | (1<<ANALOG_2_PIN) | (1<<7) | (15<<8) | (1<<16);//(1<<24); // start conversion;
+			__WFI();
+			
+			if(battery_count > (CTL_RATE * 10)){
+				if(((LPC_ADC->DR[7] >> 6) & 0x3FF) < 520){
+					battery_low = 1;
+				}else{
+					battery_low = 0;
+				}
+				LPC_GPIO0->MASKED_ACCESS[(1<<8)] = 0;
+				battery_count = 0;
+			}
+			LPC_SYSCON->PDRUNCFG |= (1<<4); // power down adc
+			control_value[2] = ((LPC_GPIO1->DATA & (1<<4)) >> 4) << 10;
+			control_value[3] = ((LPC_GPIO0->DATA & (1<<6)) >> 6) << 10;
+			LPC_GPIO0->MASKED_ACCESS[(1<<5)] = led_value[0] << 5;
+			LPC_GPIO0->MASKED_ACCESS[(1<<4)] = led_value[1] << 4;
+			if(battery_low > 0){
+				if(blink_count == (CTL_RATE / 2)){
+					LPC_GPIO1->MASKED_ACCESS[(1<<9)] = (1<<9);
+				}
+				if(blink_count > CTL_RATE){
+					LPC_GPIO1->MASKED_ACCESS[(1<<9)] = 0;
+					blink_count = 0;
+				}
+				blink_count++;
+			}
+			ctl_count = 0;
+			battery_count++;
+			control_rate_handler();
+		}
+	}
+	return 0;
+}

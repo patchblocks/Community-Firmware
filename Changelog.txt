@@ -1,0 +1,29 @@
+ Community Revision History:
+
+   1.5.3 ----------------------------------------------------------------------
+   05/07/2017 Theo Niessink (Tale)
+     Version     : 20170705
+     o Fixes earlier mentioned 2-byte MIDI message support 
+     o Fixed hanging MIDI notes with MIDI controllers that send out Channel
+       Pressure (After-Touch) [or Program Change].
+     o Fixed receiving Pitch Bend on MIDI channel other than channel 1.
+
+   12/07/2017 Theo Niessink (Tale)
+     Version     : 20170712
+     Description : http://www.taletn.com/patchblocks/
+     o Added MIDI low/high/last-note priority support to firmware.
+     o Added MIDI running status support to firmware.
+     o Added customized firmware.
+
+   12/08/2017 Chris Jeffery (Maikshifter)
+     o Added support for run-time control of MIDI Through (MIDI Through RT block)
+
+
+
+---Disclaimers----------------------------------------------------
+Copyright (C) 2017 Theo Niessink <theo@taletn.com>
+This work is free. You can redistribute it and/or modify it under the
+terms of the Do What The Fuck You Want To Public License, Version 2,
+as published by Sam Hocevar. See the LICENSE file for more details.
+
+Firmware template copyright (C) 2016 Mindflood Ltd.
